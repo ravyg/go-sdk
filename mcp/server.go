@@ -1050,6 +1050,9 @@ func (ss *ServerSession) initialized(ctx context.Context, params *InitializedPar
 	if ss.server.opts.KeepAlive > 0 {
 		ss.startKeepalive(ss.server.opts.KeepAlive)
 	}
+	if ss.onInitialized != nil {
+		ss.onInitialized()
+	}
 	if h := ss.server.opts.InitializedHandler; h != nil {
 		h(ctx, serverRequestFor(ss, params))
 	}
@@ -1095,6 +1098,7 @@ type ServerSession struct {
 	// onClose callback triggers a re-entrant call to Close.
 	calledOnClose atomic.Bool
 	onClose       func()
+	onInitialized func() // called once after initialized notification is processed
 
 	server          *Server
 	conn            *jsonrpc2.Connection
@@ -1443,6 +1447,18 @@ func (ss *ServerSession) InitializeParams() *InitializeParams {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	return ss.state.InitializeParams
+}
+
+// SessionState returns a copy of the current session state.
+//
+// This is useful for persisting session state to an external store (see
+// [SessionStore]) so that sessions can be recovered on other instances in a
+// distributed deployment.
+func (ss *ServerSession) SessionState() *ServerSessionState {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	copy := ss.state
+	return &copy
 }
 
 func (ss *ServerSession) initialize(ctx context.Context, params *InitializeParams) (*InitializeResult, error) {

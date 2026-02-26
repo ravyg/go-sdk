@@ -140,7 +140,24 @@ type StreamableHTTPOptions struct {
 	// documentation for [StreamableServerTransport].
 	Stateless bool
 
-	// TODO(#148): support session retention (?)
+	// SessionStore enables persistent, shared session storage for distributed
+	// deployments.
+	//
+	// In a default single-instance deployment sessions are kept in memory. In a
+	// multi-instance deployment behind a load balancer, a request may be routed
+	// to a different instance than the one that created the session, resulting
+	// in a 404. Setting SessionStore allows session state to be shared across
+	// instances so that sessions can be transparently recovered.
+	//
+	// When set, the handler will:
+	//   - Persist state to the store after the client completes initialization.
+	//   - Attempt to recover a session from the store before returning 404.
+	//   - Delete the session from the store when it is closed.
+	//
+	// If nil, sessions are kept in memory only (the default behaviour).
+	//
+	// See [SessionStore] for implementation guidance and a Redis example.
+	SessionStore SessionStore
 
 	// JSONResponse causes streamable responses to return application/json rather
 	// than text/event-stream ([§2.1.5] of the spec).
@@ -276,8 +293,75 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 			// validation, we require that the session ID matches a known session.
 			//
 			// In stateless mode, a temporary transport is be created below.
-			http.Error(w, "session not found", http.StatusNotFound)
-			return
+			//
+			// If a SessionStore is configured, attempt to recover the session state
+			// from the external store before giving up. This enables transparent
+			// session recovery in multi-instance deployments where the original
+			// instance may no longer be handling this request.
+			if h.opts.SessionStore != nil {
+				state, err := h.opts.SessionStore.Load(req.Context(), sessionID)
+				if err == nil && state != nil {
+					// Recovered from store: rebuild the session on this instance using
+					// the persisted state. This mirrors the stateless-mode path that
+					// uses ServerSessionOptions.State to skip the initialize handshake.
+					server := h.getServer(req)
+					if server == nil {
+						http.Error(w, "no server available", http.StatusBadRequest)
+						return
+					}
+					transport := &StreamableServerTransport{
+						SessionID:    sessionID,
+						EventStore:   h.opts.EventStore,
+						jsonResponse: h.opts.JSONResponse,
+						logger:       h.opts.Logger,
+					}
+					store := h.opts.SessionStore
+					recovered := &ServerSessionOptions{
+						State: state,
+						onClose: func() {
+							h.mu.Lock()
+							defer h.mu.Unlock()
+							if info, ok := h.sessions[sessionID]; ok {
+								info.stopTimer()
+								delete(h.sessions, sessionID)
+								if h.onTransportDeletion != nil {
+									h.onTransportDeletion(sessionID)
+								}
+							}
+							if err := store.Delete(context.Background(), sessionID); err != nil {
+								h.opts.Logger.Error("session store delete failed", "sessionID", sessionID, "error", err)
+							}
+						},
+					}
+					session, err := server.Connect(req.Context(), transport, recovered)
+					if err != nil {
+						http.Error(w, "failed to recover session", http.StatusInternalServerError)
+						return
+					}
+					var userID string
+					if tokenInfo := auth.TokenInfoFromContext(req.Context()); tokenInfo != nil {
+						userID = tokenInfo.UserID
+					}
+					sessInfo = &sessionInfo{
+						session:   session,
+						transport: transport,
+						userID:    userID,
+					}
+					if h.opts.SessionTimeout > 0 {
+						sessInfo.timeout = h.opts.SessionTimeout
+						sessInfo.timer = time.AfterFunc(sessInfo.timeout, func() {
+							sessInfo.session.Close()
+						})
+					}
+					h.mu.Lock()
+					h.sessions[sessionID] = sessInfo
+					h.mu.Unlock()
+				}
+			}
+			if sessInfo == nil {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
 		}
 		// Prevent session hijacking: if the session was created with a user ID,
 		// verify that subsequent requests come from the same user.
@@ -446,15 +530,23 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 		} else {
 			// Cleanup is only required in stateful mode, as transportation is
 			// not stored in the map otherwise.
+			sid := transport.SessionID
+			store := h.opts.SessionStore
 			connectOpts = &ServerSessionOptions{
 				onClose: func() {
 					h.mu.Lock()
 					defer h.mu.Unlock()
-					if info, ok := h.sessions[transport.SessionID]; ok {
+					if info, ok := h.sessions[sid]; ok {
 						info.stopTimer()
-						delete(h.sessions, transport.SessionID)
+						delete(h.sessions, sid)
 						if h.onTransportDeletion != nil {
-							h.onTransportDeletion(transport.SessionID)
+							h.onTransportDeletion(sid)
+						}
+					}
+					// Remove from external store if configured.
+					if store != nil {
+						if err := store.Delete(context.Background(), sid); err != nil {
+							h.opts.Logger.Error("session store delete failed", "sessionID", sid, "error", err)
 						}
 					}
 				},
@@ -507,6 +599,19 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 					session.Close()
 				}
 			}()
+			// Persist full session state to the external store once the complete
+			// initialize handshake (initialize + notifications/initialized) is done,
+			// so that other instances can transparently recover the session.
+			if h.opts.SessionStore != nil {
+				store := h.opts.SessionStore
+				sid := transport.SessionID
+				session.onInitialized = func() {
+					state := session.SessionState()
+					if err := store.Store(context.Background(), sid, state); err != nil {
+						h.opts.Logger.Error("session store persist failed", "sessionID", sid, "error", err)
+					}
+				}
+			}
 		}
 	}
 
